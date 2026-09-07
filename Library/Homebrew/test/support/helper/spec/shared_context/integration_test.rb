@@ -134,6 +134,19 @@ module Test
         end
       end
 
+      # A `bin/brew` inside the test prefix, so `brew.sh` resolves
+      # `HOMEBREW_REPOSITORY` to the sandbox and enumerates its taps rather than
+      # whichever ones the developer has installed. It has to be a copy, because
+      # `bin/brew` resolves a symlinked entry point back to the real repository.
+      sig { returns(String) }
+      def sandboxed_brew_sh
+        FileUtils.ln_sf HOMEBREW_LIBRARY_PATH, HOMEBREW_LIBRARY/"Homebrew"
+        # `install` rather than `cp`: the shared context below touches a
+        # non-executable `bin/brew` and `cp` would keep the destination's mode.
+        FileUtils.install HOMEBREW_ORIGINAL_BREW_FILE, HOMEBREW_PREFIX/"bin/brew", mode: 0755
+        (HOMEBREW_PREFIX/"bin/brew").to_s
+      end
+
       sig { params(args: T.untyped).returns(Process::Status) }
       def brew_sh(*args)
         env = args.last.is_a?(Hash) ? args.pop : {}
@@ -298,7 +311,7 @@ RSpec.shared_context "integration test" do # rubocop:disable RSpec/ContextWordin
 
     example.run
   ensure
-    FileUtils.rm_rf HOMEBREW_PREFIX/"bin"
+    FileUtils.rm_rf [HOMEBREW_PREFIX/"bin", HOMEBREW_LIBRARY/"Homebrew"]
     ENV.delete("HOMEBREW_INTEGRATION_TEST")
   end
 end
