@@ -344,6 +344,11 @@ module Homebrew
 
         require "utils/github"
         github_users = users.keys.to_h { |user| [user, github_username_for(user, to:)] }
+        # Real names/public emails, so commits under a maintainer's git identity are matched to their username.
+        github_identities = users.keys.to_h do |user|
+          github_user = github_users.fetch(user)
+          [user, github_user ? github_identity_for_username(github_user, to:) : [nil, nil]]
+        end
         git_authored_pull_requests = users.keys.to_h do |user|
           [user, repositories.to_h { |repository| [repository, Set.new] }]
         end
@@ -358,7 +363,8 @@ module Homebrew
           )
           authored_pull_requests = users.keys.to_h { |user| [user, Set.new] }
           merged_pull_requests = users.keys.to_h { |user| [user, Set.new] }
-          parse_git_log(output, users, authored_pull_requests:, merged_pull_requests:).each do |user, counts|
+          parse_git_log(output, users, github_identities:, authored_pull_requests:, merged_pull_requests:)
+            .each do |user, counts|
             results.fetch(user)[repository] = counts
             git_authored_pull_requests.fetch(user)[repository] = authored_pull_requests.fetch(user)
             git_merged_pull_requests.fetch(user)[repository] = merged_pull_requests.fetch(user)
@@ -497,25 +503,57 @@ module Homebrew
           .returns(T::Array[T::Hash[String, T.untyped]])
       }
       def github_search_with_rate_limit(cache_key, to:, &block)
+        result = github_cache_with_rate_limit(cache_key, to:, &block)
+        result.is_a?(Array) ? result : []
+      end
+
+      sig { params(username: String, to: String).returns([T.nilable(String), T.nilable(String)]) }
+      def github_identity_for_username(username, to:)
+        cache_key = ["user-profile", username].join("\0")
+        profile = github_hash_with_rate_limit(cache_key, to:) do
+          GitHub::API.open_rest(GitHub.url_to("users", username))
+        rescue GitHub::API::HTTPNotFoundError
+          {}
+        end
+        [profile["name"], profile["email"]]
+      end
+
+      sig {
+        params(cache_key: String, to: String, block: T.proc.returns(T::Hash[String, T.untyped]))
+          .returns(T::Hash[String, T.untyped])
+      }
+      def github_hash_with_rate_limit(cache_key, to:, &block)
+        result = github_cache_with_rate_limit(cache_key, to:, &block)
+        result.is_a?(Hash) ? result : {}
+      end
+
+      sig {
+        params(
+          cache_key: String,
+          to:        String,
+          block:     T.proc.returns(T.any(T::Array[T::Hash[String, T.untyped]], T::Hash[String, T.untyped])),
+        ).returns(T.any(T::Array[T::Hash[String, T.untyped]], T::Hash[String, T.untyped]))
+      }
+      def github_cache_with_rate_limit(cache_key, to:, &block)
         cache_path = if Date.iso8601(to) <= Date.today
           HOMEBREW_CACHE/"contributions--#{Digest::SHA256.hexdigest("1\0#{cache_key}")}.json"
         end
         if cache_path&.file?
           begin
-            cached_results = JSON.parse(cache_path.read)
-            return cached_results if cached_results.is_a?(Array)
+            cached_result = JSON.parse(cache_path.read)
+            return cached_result if cached_result.is_a?(Array) || cached_result.is_a?(Hash)
           rescue JSON::ParserError, Errno::ENOENT
             nil
           end
           cache_path.unlink if cache_path.exist?
         end
 
-        results = yield
+        result = yield
         if cache_path
           HOMEBREW_CACHE.mkpath
-          cache_path.atomic_write(JSON.generate(results))
+          cache_path.atomic_write(JSON.generate(result))
         end
-        results
+        result
       rescue GitHub::API::RateLimitExceededError => e
         GitHub::API.sleep_for_rate_limit(e)
         retry
@@ -525,12 +563,13 @@ module Homebrew
         params(
           output:                 String,
           users:                  T::Hash[String, String],
+          github_identities:      T.nilable(T::Hash[String, [T.nilable(String), T.nilable(String)]]),
           authored_pull_requests: T.nilable(T::Hash[String, T::Set[String]]),
           merged_pull_requests:   T.nilable(T::Hash[String, T::Set[String]]),
         )
           .returns(T::Hash[String, T::Hash[Symbol, Integer]])
       }
-      def parse_git_log(output, users, authored_pull_requests: nil, merged_pull_requests: nil)
+      def parse_git_log(output, users, github_identities: nil, authored_pull_requests: nil, merged_pull_requests: nil)
         counts = users.to_h do |user, _|
           [user, CONTRIBUTION_TYPES.keys.to_h { |type| [type, 0] }]
         end
@@ -539,6 +578,13 @@ module Homebrew
           identity_users[user.downcase] = user
           identity_users[name.downcase] = user
           identity_users[user.split("@").first.to_s.sub(/\A\d+\+/, "").downcase] = user
+
+          github_name, github_email = github_identities&.fetch(user, nil)
+          identity_users[github_name.downcase] ||= user if github_name
+          next unless github_email
+
+          identity_users[github_email.downcase] ||= user
+          identity_users[github_email.split("@").first.to_s.sub(/\A\d+\+/, "").downcase] ||= user
         end
         records = output.split("\x1e").filter_map do |record|
           fields = record.strip.split("\x1f", 5)
